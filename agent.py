@@ -1,6 +1,5 @@
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import re
@@ -8,8 +7,7 @@ import sqlite3
 import textwrap
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import requests
 import yaml
@@ -22,149 +20,24 @@ DB_PATH = "memory.db"
 PROFILE_PATH = "research_profile.yaml"
 REPORT_DIR = "reports"
 
-# Default is intentionally Qwen3:8b because it is a strong local tool/planning model in Ollama.
-# Override with: OLLAMA_MODEL=qwen3:8b
-DEFAULT_MODEL = "qwen3:8b"
-
-AUTONOMY_POLICY = {
-    "search_papers": "auto",
-    "score_papers": "auto",
-    "generate_brief": "auto",
-    "generate_gap_analysis": "auto",
-    "draft_grant_skeleton": "auto",
-    "draft_email": "draft_only",
-    "update_memory": "auto",
-    "evolve_profile": "ask",
-    "send_email": "never",
-    "submit_grant": "never",
-    "delete_files": "never",
-    "financial_decision": "never",
-}
-
-AGENT_ROLES = {
-    "strategic_governor": "Decide priority, mission fit, risk, and next actions.",
-    "research_scout": "Search and interpret papers as research opportunities, not summaries.",
-    "grant_architect": "Convert research opportunities into fundable proposal logic.",
-    "scientific_verifier": "Attack weak claims, unsupported novelty, feasibility gaps, and evidence gaps.",
-    "communication_engine": "Convert outputs into teaching, LinkedIn, public, and collaboration drafts.",
-    "self_evolution_engine": "Learn from feedback and update memory, rubrics, and workflow rules safely.",
-}
-
-
-# -----------------------------
-# Core utilities
-# -----------------------------
-
-def now() -> str:
-    return dt.datetime.now().isoformat(timespec="seconds")
-
-
-def today() -> str:
-    return dt.date.today().isoformat()
-
-
-def ensure_dirs() -> None:
-    os.makedirs(REPORT_DIR, exist_ok=True)
-
 
 def load_settings() -> Dict[str, str]:
     load_dotenv()
     return {
-        "model": os.getenv("OLLAMA_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL,
+        "model": os.getenv("OLLAMA_MODEL", "llama3.1:8b"),
         "openalex_api_key": os.getenv("OPENALEX_API_KEY", "").strip(),
-        "temperature": os.getenv("OLLAMA_TEMPERATURE", "0.15").strip(),
-        "num_ctx": os.getenv("OLLAMA_NUM_CTX", "8192").strip(),
     }
 
 
 def load_profile() -> Dict[str, Any]:
-    if not os.path.exists(PROFILE_PATH):
-        raise FileNotFoundError(
-            f"Missing {PROFILE_PATH}. Create it before running the agent."
-        )
     with open(PROFILE_PATH, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.safe_load(f)
 
 
 def save_profile(profile: Dict[str, Any]) -> None:
     with open(PROFILE_PATH, "w", encoding="utf-8") as f:
         yaml.safe_dump(profile, f, sort_keys=False, allow_unicode=True)
 
-
-def stable_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def clamp_score(value: Any, default: float = 5.0) -> float:
-    try:
-        score = float(value)
-    except Exception:
-        score = default
-    return max(0.0, min(10.0, score))
-
-
-def get_ollama_content(response: Any) -> str:
-    try:
-        return response.message.content
-    except AttributeError:
-        return response["message"]["content"]
-
-
-def strip_thinking(text: str) -> str:
-    """Qwen3 can emit <think>...</think>. Remove it for stable downstream parsing."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
-def clean_json(text: str) -> Dict[str, Any]:
-    text = strip_thinking(text).strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise
-
-
-def clean_yaml(text: str) -> str:
-    text = strip_thinking(text).strip()
-    fenced = re.search(r"```(?:yaml|yml)?\s*(.*?)```", text, re.DOTALL)
-    return fenced.group(1).strip() if fenced else text
-
-
-def ask_llm(
-    system_prompt: str,
-    user_prompt: str,
-    *,
-    json_mode: bool = False,
-    temperature: Optional[float] = None,
-    num_ctx: Optional[int] = None,
-) -> str:
-    settings = load_settings()
-    options = {
-        "temperature": temperature if temperature is not None else float(settings["temperature"]),
-        "num_ctx": num_ctx if num_ctx is not None else int(settings["num_ctx"]),
-    }
-    kwargs: Dict[str, Any] = {
-        "model": settings["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "options": options,
-    }
-    if json_mode:
-        kwargs["format"] = "json"
-    response = chat(**kwargs)
-    return strip_thinking(get_ollama_content(response))
-
-
-# -----------------------------
-# Database and memory
-# -----------------------------
 
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -182,17 +55,16 @@ def init_db() -> None:
             published_date TEXT,
             authors TEXT,
             cited_by_count INTEGER DEFAULT 0,
+
             relevance REAL,
             novelty REAL,
             grant_potential REAL,
             collaboration_potential REAL,
             industry_potential REAL,
             teaching_public_value REAL,
-            feasibility REAL DEFAULT 5,
-            risk REAL DEFAULT 5,
             total_score REAL,
+
             agent_commentary TEXT,
-            evidence_gaps TEXT,
             recommended_action TEXT,
             status TEXT DEFAULT 'new',
             created_at TEXT
@@ -210,192 +82,78 @@ def init_db() -> None:
         """
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_type TEXT,
-            content TEXT,
-            source TEXT,
-            confidence REAL,
-            tags TEXT,
-            created_at TEXT,
-            review_after TEXT
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            rationale TEXT,
-            agent TEXT,
-            priority INTEGER,
-            effort INTEGER,
-            risk INTEGER,
-            status TEXT DEFAULT 'open',
-            created_at TEXT,
-            completed_at TEXT
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS reflections (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            workflow TEXT,
-            user_input TEXT,
-            result_summary TEXT,
-            lesson TEXT,
-            memory_update TEXT,
-            created_at TEXT
-        )
-        """
-    )
-
-    # Lightweight migrations for existing DBs.
-    for column, definition in [
-        ("feasibility", "REAL DEFAULT 5"),
-        ("risk", "REAL DEFAULT 5"),
-        ("evidence_gaps", "TEXT"),
-    ]:
-        try:
-            cur.execute(f"ALTER TABLE papers ADD COLUMN {column} {definition}")
-        except sqlite3.OperationalError:
-            pass
-
     conn.commit()
     conn.close()
 
 
-def save_memory(
-    memory_type: str,
-    content: str,
-    source: str,
-    confidence: float = 0.7,
-    tags: Optional[List[str]] = None,
-    review_after: Optional[str] = None,
-) -> None:
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO memories (memory_type, content, source, confidence, tags, created_at, review_after)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            memory_type,
-            content.strip(),
-            source,
-            clamp_score(confidence * 10) / 10,
-            json.dumps(tags or [], ensure_ascii=False),
-            now(),
-            review_after,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def load_recent_memories(limit: int = 10, memory_type: Optional[str] = None) -> List[Dict[str, Any]]:
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    if memory_type:
-        cur.execute(
-            "SELECT memory_type, content, source, confidence, tags, created_at FROM memories WHERE memory_type=? ORDER BY id DESC LIMIT ?",
-            (memory_type, limit),
-        )
-    else:
-        cur.execute(
-            "SELECT memory_type, content, source, confidence, tags, created_at FROM memories ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-    rows = cur.fetchall()
-    conn.close()
-    return [
-        {
-            "memory_type": r[0],
-            "content": r[1],
-            "source": r[2],
-            "confidence": r[3],
-            "tags": json.loads(r[4] or "[]"),
-            "created_at": r[5],
-        }
-        for r in rows
-    ]
-
-
-def format_memories(memories: List[Dict[str, Any]]) -> str:
-    if not memories:
-        return "No relevant memories yet."
-    return "\n".join(
-        f"- [{m['memory_type']}; confidence={m['confidence']}] {m['content']} (source={m['source']})"
-        for m in memories
-    )
-
-
-def add_task(title: str, rationale: str, agent: str, priority: int, effort: int, risk: int) -> None:
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO tasks (title, rationale, agent, priority, effort, risk, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (title, rationale, agent, int(priority), int(effort), int(risk), now()),
-    )
-    conn.commit()
-    conn.close()
-
-
-# -----------------------------
-# Paper search tools
-# -----------------------------
-
-def reconstruct_openalex_abstract(inv_index: Optional[Dict[str, List[int]]]) -> str:
+def reconstruct_openalex_abstract(inv_index: Dict[str, List[int]] | None) -> str:
     if not inv_index:
         return ""
-    positioned_words: List[Tuple[int, str]] = []
+
+    positioned_words = []
     for word, positions in inv_index.items():
         for pos in positions:
             positioned_words.append((pos, word))
+
     positioned_words.sort(key=lambda x: x[0])
     return " ".join(word for _, word in positioned_words)
 
 
 def search_openalex(query: str, max_results: int = 5) -> List[Dict[str, Any]]:
     settings = load_settings()
-    params = {"search": query, "per-page": max_results, "sort": "publication_date:desc"}
+
+    params = {
+        "search": query,
+        "per-page": max_results,
+        "sort": "publication_date:desc",
+    }
+
     if settings["openalex_api_key"]:
         params["api_key"] = settings["openalex_api_key"]
-    response = requests.get("https://api.openalex.org/works", params=params, timeout=30)
+
+    response = requests.get(
+        "https://api.openalex.org/works",
+        params=params,
+        timeout=30,
+    )
     response.raise_for_status()
+
+    data = response.json()
     papers = []
-    for item in response.json().get("results", []):
+
+    for item in data.get("results", []):
+        title = item.get("title") or item.get("display_name") or ""
+        abstract = reconstruct_openalex_abstract(item.get("abstract_inverted_index"))
+
         primary_location = item.get("primary_location") or {}
+        url = (
+            item.get("doi")
+            or primary_location.get("landing_page_url")
+            or item.get("id")
+            or ""
+        )
+
+        authorships = item.get("authorships") or []
         authors = []
-        for a in (item.get("authorships") or [])[:8]:
-            name = (a.get("author") or {}).get("display_name")
+        for a in authorships[:8]:
+            author = a.get("author") or {}
+            name = author.get("display_name")
             if name:
                 authors.append(name)
+
         papers.append(
             {
                 "source": "OpenAlex",
-                "title": (item.get("title") or item.get("display_name") or "").strip(),
-                "abstract": reconstruct_openalex_abstract(item.get("abstract_inverted_index")).strip(),
-                "url": item.get("doi") or primary_location.get("landing_page_url") or item.get("id") or "",
+                "title": title.strip(),
+                "abstract": abstract.strip(),
+                "url": url,
                 "published_date": item.get("publication_date", ""),
                 "authors": ", ".join(authors),
                 "cited_by_count": item.get("cited_by_count", 0),
             }
         )
-    time.sleep(0.2)
+
+    time.sleep(0.2)  # polite pause; well within OpenAlex 100 req/s limit
     return papers
 
 
@@ -403,7 +161,11 @@ def arxiv_query_from_topic(topic: str) -> str:
     topic = topic.strip()
     if not topic:
         return "all:OLED"
-    return f'all:"{topic}"' if " " in topic else f"all:{topic}"
+    # Use a quoted phrase for multi-word topics so arXiv treats them as a unit,
+    # preventing single-word splits that pull in completely unrelated papers.
+    if " " in topic:
+        return f'all:"{topic}"'
+    return f"all:{topic}"
 
 
 def search_arxiv(topic: str, max_results: int = 5) -> List[Dict[str, Any]]:
@@ -414,319 +176,108 @@ def search_arxiv(topic: str, max_results: int = 5) -> List[Dict[str, Any]]:
         "sortBy": "submittedDate",
         "sortOrder": "descending",
     }
-    response = requests.get("https://export.arxiv.org/api/query", params=params, timeout=30)
+
+    response = requests.get(
+        "https://export.arxiv.org/api/query",
+        params=params,
+        timeout=30,
+    )
     response.raise_for_status()
+
     root = ET.fromstring(response.text)
     ns = {"atom": "http://www.w3.org/2005/Atom"}
+
     papers = []
     for entry in root.findall("atom:entry", ns):
-        authors = [
-            a.findtext("atom:name", default="", namespaces=ns)
-            for a in entry.findall("atom:author", ns)
-        ]
+        title = entry.findtext("atom:title", default="", namespaces=ns)
+        abstract = entry.findtext("atom:summary", default="", namespaces=ns)
+        url = entry.findtext("atom:id", default="", namespaces=ns)
+        published = entry.findtext("atom:published", default="", namespaces=ns)
+
+        authors = []
+        for author in entry.findall("atom:author", ns):
+            name = author.findtext("atom:name", default="", namespaces=ns)
+            if name:
+                authors.append(name)
+
         papers.append(
             {
                 "source": "arXiv",
-                "title": " ".join(entry.findtext("atom:title", default="", namespaces=ns).split()),
-                "abstract": " ".join(entry.findtext("atom:summary", default="", namespaces=ns).split()),
-                "url": entry.findtext("atom:id", default="", namespaces=ns),
-                "published_date": entry.findtext("atom:published", default="", namespaces=ns)[:10],
-                "authors": ", ".join([a for a in authors if a][:8]),
+                "title": " ".join(title.split()),
+                "abstract": " ".join(abstract.split()),
+                "url": url,
+                "published_date": published[:10],
+                "authors": ", ".join(authors[:8]),
                 "cited_by_count": 0,
             }
         )
-    time.sleep(3)
+
+    time.sleep(3)  # arXiv requires >= 3 s between requests (single connection)
     return papers
 
 
-def make_unique_key(paper: Dict[str, Any]) -> str:
-    base = paper.get("url") or paper.get("title") or ""
-    return re.sub(r"\s+", " ", base.lower()).strip()
-
-
-# -----------------------------
-# Agentic reasoning modules
-# -----------------------------
-
-def mission_context(profile: Dict[str, Any]) -> str:
-    return yaml.safe_dump(profile, sort_keys=False, allow_unicode=True)
-
-
-def strategic_governor(user_input: str, memories: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    profile = load_profile()
-    system = f"""
-You are the Strategic Governor for a bounded self-evolving research agent.
-Your job is to choose the highest-leverage next move, not merely answer.
-Be evidence-grounded, realistic, and mission-aligned.
-Never authorize external irreversible actions.
-"""
-    prompt = f"""
-Research profile:
-{mission_context(profile)}
-
-Recent memories:
-{format_memories(memories or load_recent_memories(12))}
-
-User input:
-{user_input}
-
-Return only valid JSON:
-{{
-  "strategic_classification": "research|grant|collaboration|teaching|communication|memory|mixed",
-  "mission_fit": 0,
-  "priority": 0,
-  "risk": 0,
-  "why_it_matters": "...",
-  "recommended_workflow": "paper_to_opportunity|idea_to_grant|weekly_brief|gap_analysis|reviewer_simulation|reflection|custom",
-  "next_actions": ["action 1", "action 2", "action 3"],
-  "agents_to_run": ["research_scout", "grant_architect", "scientific_verifier"],
-  "approval_required": false
-}}
-"""
+def get_ollama_content(response: Any) -> str:
     try:
-        data = clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.1))
-    except Exception:
-        data = {
-            "strategic_classification": "mixed",
-            "mission_fit": 5,
-            "priority": 5,
-            "risk": 5,
-            "why_it_matters": "Could not parse governor output; proceed cautiously.",
-            "recommended_workflow": "custom",
-            "next_actions": ["Review input manually", "Run a conservative analysis", "Save feedback"],
-            "agents_to_run": ["research_scout", "scientific_verifier"],
-            "approval_required": False,
-        }
-    return data
+        return response.message.content
+    except AttributeError:
+        return response["message"]["content"]
 
 
-def research_scout(user_input: str) -> Dict[str, Any]:
-    profile = load_profile()
-    system = "You are a Research Scout. Convert information into opportunity maps. Distinguish evidence, assumptions, and speculation."
-    prompt = f"""
-Profile:
-{mission_context(profile)}
+def clean_json(text: str) -> Dict[str, Any]:
+    text = text.strip()
 
-Recent memories:
-{format_memories(load_recent_memories(12))}
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
 
-Input:
-{user_input}
-
-Return only valid JSON:
-{{
-  "research_opportunity": "...",
-  "scientific_gap": "...",
-  "novelty_hypothesis": "...",
-  "evidence_strength": 0,
-  "key_uncertainties": ["..."],
-  "possible_paper_angle": "...",
-  "possible_grant_angle": "...",
-  "next_research_actions": ["..."],
-  "search_queries": ["..."]
-}}
-"""
-    return clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.15))
-
-
-def grant_architect(user_input: str, scout_output: Dict[str, Any]) -> Dict[str, Any]:
-    profile = load_profile()
-    system = "You are a Grant Architect. Convert ideas into fundable, reviewable proposal logic. Do not invent citations."
-    prompt = f"""
-Profile:
-{mission_context(profile)}
-
-Original input:
-{user_input}
-
-Research Scout output:
-{json.dumps(scout_output, indent=2, ensure_ascii=False)}
-
-Return only valid JSON:
-{{
-  "possible_title": "...",
-  "problem_statement": "...",
-  "central_hypothesis": "...",
-  "objectives": ["Objective 1", "Objective 2", "Objective 3"],
-  "methodology_overview": "...",
-  "work_packages": ["..."],
-  "expected_outcomes": ["..."],
-  "risk_mitigation": ["..."],
-  "reviewer_attack_points": ["..."],
-  "collaborator_needs": ["..."],
-  "grant_fit_score": 0
-}}
-"""
-    return clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.15))
-
-
-def scientific_verifier(user_input: str, scout_output: Dict[str, Any], grant_output: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    system = "You are a Scientific Verifier. Be skeptical. Separate supported claims from attractive but weak claims."
-    prompt = f"""
-Original input:
-{user_input}
-
-Research Scout output:
-{json.dumps(scout_output, indent=2, ensure_ascii=False)}
-
-Grant Architect output:
-{json.dumps(grant_output or {}, indent=2, ensure_ascii=False)}
-
-Return only valid JSON:
-{{
-  "strongest_claim": "...",
-  "weakest_claim": "...",
-  "unsupported_assumptions": ["..."],
-  "missing_evidence": ["..."],
-  "feasibility_score": 0,
-  "novelty_score": 0,
-  "fundability_score": 0,
-  "risk_score": 0,
-  "concrete_improvements_needed": ["..."],
-  "final_recommendation": "proceed|revise|park|reject"
-}}
-"""
-    return clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.1))
-
-
-def communication_engine(user_input: str, scout_output: Dict[str, Any], verifier_output: Dict[str, Any]) -> Dict[str, Any]:
-    system = "You are a Teaching and Communication Engine. Make science clear without overstating evidence."
-    prompt = f"""
-Input:
-{user_input}
-
-Scout:
-{json.dumps(scout_output, indent=2, ensure_ascii=False)}
-
-Verifier:
-{json.dumps(verifier_output, indent=2, ensure_ascii=False)}
-
-Return only valid JSON:
-{{
-  "teaching_angle": "...",
-  "linkedin_post_draft": "...",
-  "collaboration_email_draft": "...",
-  "public_explanation": "...",
-  "caution_statement": "..."
-}}
-"""
-    return clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.25))
-
-
-def save_reflection(workflow: str, user_input: str, outputs: Dict[str, Any], feedback: str = "") -> Dict[str, Any]:
-    system = "You are the Self-Evolution Engine. Extract durable lessons, not every detail."
-    prompt = f"""
-Workflow: {workflow}
-User input: {user_input}
-Outputs:
-{json.dumps(outputs, indent=2, ensure_ascii=False)}
-User feedback: {feedback or 'No explicit feedback.'}
-
-Return only valid JSON:
-{{
-  "result_summary": "...",
-  "lesson": "...",
-  "memory_update": "...",
-  "tags": ["..."],
-  "confidence": 0.0,
-  "should_store_memory": true
-}}
-"""
     try:
-        reflection = clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.1))
-    except Exception:
-        reflection = {
-            "result_summary": "Workflow completed, but reflection parsing failed.",
-            "lesson": "Keep outputs parseable and conservative.",
-            "memory_update": "Parsing failure occurred during reflection.",
-            "tags": ["self-evolution", "parse-failure"],
-            "confidence": 0.5,
-            "should_store_memory": True,
-        }
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
 
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO reflections (workflow, user_input, result_summary, lesson, memory_update, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            workflow,
-            user_input,
-            reflection.get("result_summary", ""),
-            reflection.get("lesson", ""),
-            reflection.get("memory_update", ""),
-            now(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    if reflection.get("should_store_memory", True):
-        save_memory(
-            "workflow_lesson",
-            reflection.get("memory_update", reflection.get("lesson", "")),
-            source=f"reflection:{workflow}",
-            confidence=float(reflection.get("confidence", 0.7) or 0.7),
-            tags=reflection.get("tags", []),
-        )
-    return reflection
-
-
-def run_agentic_workflow(user_input: str, include_communication: bool = True) -> Dict[str, Any]:
-    init_db()
-    governor = strategic_governor(user_input)
-    scout = research_scout(user_input)
-    grant = grant_architect(user_input, scout)
-    verifier = scientific_verifier(user_input, scout, grant)
-    communication = communication_engine(user_input, scout, verifier) if include_communication else {}
-
-    outputs = {
-        "strategic_governor": governor,
-        "research_scout": scout,
-        "grant_architect": grant,
-        "scientific_verifier": verifier,
-        "communication_engine": communication,
-    }
-
-    for action in governor.get("next_actions", [])[:5]:
-        add_task(
-            title=str(action)[:120],
-            rationale=governor.get("why_it_matters", ""),
-            agent="strategic_governor",
-            priority=int(clamp_score(governor.get("priority", 5))),
-            effort=5,
-            risk=int(clamp_score(governor.get("risk", 5))),
-        )
-
-    outputs["reflection"] = save_reflection("agentic_workflow", user_input, outputs)
-    return outputs
-
-
-# -----------------------------
-# Scoring and persistence
-# -----------------------------
 
 def score_paper(profile: Dict[str, Any], paper: Dict[str, Any]) -> Dict[str, Any]:
-    system = "You are a bounded Research Evolution Agent using Qwen3. Score papers as strategic opportunities. Return strict JSON."
+    settings = load_settings()
+
     prompt = f"""
-Research profile:
-{mission_context(profile)}
+You are a Research Evolution Agent for a researcher working on:
+{profile["topics"]}
+
+The agent's mission:
+{profile["identity"]["mission"]}
 
 Negative filters:
-{profile.get('negative_filters', [])}
+{profile.get("negative_filters", [])}
+
+Score the paper from 0 to 10 for:
+
+1. relevance
+2. novelty
+3. grant_potential
+4. collaboration_potential
+5. industry_potential
+6. teaching_public_value
+
+Then recommend exactly one action:
+- read_now
+- save_for_later
+- use_for_grant
+- contact_author
+- use_for_teaching
+- use_for_linkedin
+- ignore
 
 Paper:
-Title: {paper.get('title', '')}
-Authors: {paper.get('authors', '')}
-Source: {paper.get('source', '')}
-Published: {paper.get('published_date', '')}
-Citations: {paper.get('cited_by_count', 0)}
-Abstract: {paper.get('abstract', '')}
+Title: {paper["title"]}
+Authors: {paper.get("authors", "")}
+Source: {paper["source"]}
+Published: {paper["published_date"]}
+Citations: {paper.get("cited_by_count", 0)}
+Abstract: {paper["abstract"]}
 
-Score 0-10. Be skeptical. Reward fundable novelty, device relevance, collaboration potential, and clear next action.
 Return only valid JSON:
 {{
   "relevance": 0,
@@ -735,15 +286,25 @@ Return only valid JSON:
   "collaboration_potential": 0,
   "industry_potential": 0,
   "teaching_public_value": 0,
-  "feasibility": 0,
-  "risk": 0,
   "commentary": "short critical explanation",
-  "evidence_gaps": ["missing evidence 1"],
-  "recommended_action": "read_now|save_for_later|use_for_grant|contact_author|use_for_teaching|use_for_linkedin|ignore"
+  "recommended_action": "read_now"
 }}
 """
+
+    response = chat(
+        model=settings["model"],
+        messages=[{"role": "user", "content": prompt}],
+        format="json",
+        options={
+            "temperature": 0.1,
+            "num_ctx": 4096,
+        },
+    )
+
+    content = get_ollama_content(response)
+
     try:
-        data = clean_json(ask_llm(system, prompt, json_mode=True, temperature=0.1, num_ctx=8192))
+        data = clean_json(content)
     except Exception:
         data = {
             "relevance": 5,
@@ -752,63 +313,94 @@ Return only valid JSON:
             "collaboration_potential": 5,
             "industry_potential": 5,
             "teaching_public_value": 5,
-            "feasibility": 5,
-            "risk": 5,
             "commentary": "LLM output could not be parsed. Manual review required.",
-            "evidence_gaps": ["Could not parse model evidence assessment."],
             "recommended_action": "save_for_later",
         }
-    for key in [
-        "relevance", "novelty", "grant_potential", "collaboration_potential",
-        "industry_potential", "teaching_public_value", "feasibility", "risk",
-    ]:
-        data[key] = clamp_score(data.get(key, 5))
+
+    required = [
+        "relevance",
+        "novelty",
+        "grant_potential",
+        "collaboration_potential",
+        "industry_potential",
+        "teaching_public_value",
+    ]
+
+    for key in required:
+        try:
+            data[key] = float(data.get(key, 5))
+        except Exception:
+            data[key] = 5.0
+
     data["commentary"] = str(data.get("commentary", "")).strip()
-    data["recommended_action"] = str(data.get("recommended_action", "save_for_later")).strip()
-    if not isinstance(data.get("evidence_gaps"), list):
-        data["evidence_gaps"] = [str(data.get("evidence_gaps", ""))]
+    data["recommended_action"] = str(
+        data.get("recommended_action", "save_for_later")
+    ).strip()
+
     return data
 
 
 def calculate_total(profile: Dict[str, Any], scores: Dict[str, Any]) -> float:
-    w = profile.get("weights", {})
+    w = profile["weights"]
+
     total = (
-        float(w.get("relevance", 0.25)) * scores["relevance"]
-        + float(w.get("novelty", 0.20)) * scores["novelty"]
-        + float(w.get("grant_potential", 0.20)) * scores["grant_potential"]
-        + float(w.get("collaboration_potential", 0.15)) * scores["collaboration_potential"]
-        + float(w.get("industry_potential", 0.10)) * scores["industry_potential"]
-        + float(w.get("teaching_public_value", 0.10)) * scores["teaching_public_value"]
+        w["relevance"] * scores["relevance"]
+        + w["novelty"] * scores["novelty"]
+        + w["grant_potential"] * scores["grant_potential"]
+        + w["collaboration_potential"] * scores["collaboration_potential"]
+        + w["industry_potential"] * scores["industry_potential"]
+        + w["teaching_public_value"] * scores["teaching_public_value"]
     )
-    # Penalize high risk unless feasibility is also high.
-    total += 0.05 * scores.get("feasibility", 5) - 0.05 * scores.get("risk", 5)
-    return round(max(0.0, min(10.0, total)), 2)
+
+    return round(total, 2)
 
 
-def save_scored_paper(paper: Dict[str, Any], scores: Dict[str, Any], total_score: float) -> None:
-    init_db()
+def make_unique_key(paper: Dict[str, Any]) -> str:
+    base = paper.get("url") or paper.get("title") or ""
+    return re.sub(r"\s+", " ", base.lower()).strip()
+
+
+def save_scored_paper(
+    paper: Dict[str, Any],
+    scores: Dict[str, Any],
+    total_score: float,
+) -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute(
         """
         INSERT OR IGNORE INTO papers (
-            unique_key, source, title, abstract, url, published_date, authors, cited_by_count,
-            relevance, novelty, grant_potential, collaboration_potential, industry_potential,
-            teaching_public_value, feasibility, risk, total_score, agent_commentary,
-            evidence_gaps, recommended_action, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            unique_key, source, title, abstract, url, published_date,
+            authors, cited_by_count,
+            relevance, novelty, grant_potential, collaboration_potential,
+            industry_potential, teaching_public_value, total_score,
+            agent_commentary, recommended_action, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            make_unique_key(paper), paper.get("source", ""), paper.get("title", ""),
-            paper.get("abstract", ""), paper.get("url", ""), paper.get("published_date", ""),
-            paper.get("authors", ""), int(paper.get("cited_by_count", 0) or 0),
-            scores["relevance"], scores["novelty"], scores["grant_potential"],
-            scores["collaboration_potential"], scores["industry_potential"], scores["teaching_public_value"],
-            scores.get("feasibility", 5), scores.get("risk", 5), total_score,
-            scores.get("commentary", ""), json.dumps(scores.get("evidence_gaps", []), ensure_ascii=False),
-            scores.get("recommended_action", "save_for_later"), now(),
+            make_unique_key(paper),
+            paper.get("source", ""),
+            paper.get("title", ""),
+            paper.get("abstract", ""),
+            paper.get("url", ""),
+            paper.get("published_date", ""),
+            paper.get("authors", ""),
+            int(paper.get("cited_by_count", 0) or 0),
+            scores["relevance"],
+            scores["novelty"],
+            scores["grant_potential"],
+            scores["collaboration_potential"],
+            scores["industry_potential"],
+            scores["teaching_public_value"],
+            total_score,
+            scores["commentary"],
+            scores["recommended_action"],
+            dt.datetime.now().isoformat(timespec="seconds"),
         ),
     )
+
     conn.commit()
     conn.close()
 
@@ -816,9 +408,10 @@ def save_scored_paper(paper: Dict[str, Any], scores: Dict[str, Any], total_score
 def collect_and_score(max_per_topic: int = 3) -> None:
     init_db()
     profile = load_profile()
-    all_papers: List[Dict[str, Any]] = []
 
-    for topic in profile.get("topics", []):
+    all_papers = []
+
+    for topic in profile["topics"]:
         print(f"[bold blue]Searching OpenAlex:[/bold blue] {topic}")
         try:
             all_papers.extend(search_openalex(topic, max_results=max_per_topic))
@@ -831,7 +424,9 @@ def collect_and_score(max_per_topic: int = 3) -> None:
         except Exception as e:
             print(f"[red]arXiv failed for {topic}: {e}[/red]")
 
-    seen, unique_papers = set(), []
+    seen = set()
+    unique_papers = []
+
     for paper in all_papers:
         key = make_unique_key(paper)
         if not paper.get("title") or key in seen:
@@ -840,213 +435,321 @@ def collect_and_score(max_per_topic: int = 3) -> None:
         unique_papers.append(paper)
 
     print(f"[bold green]Found {len(unique_papers)} unique papers.[/bold green]")
+
     for paper in unique_papers:
-        print(f"[bold yellow]Scoring:[/bold yellow] {paper['title'][:100]}")
+        title = paper["title"][:100]
+        print(f"[bold yellow]Scoring:[/bold yellow] {title}")
+
         scores = score_paper(profile, paper)
         total = calculate_total(profile, scores)
         save_scored_paper(paper, scores, total)
-        print(f"  Score={total} | Action={scores['recommended_action']} | Risk={scores.get('risk', 5)}")
+
+        print(
+            f"  Score={total} | Action={scores['recommended_action']} | "
+            f"{scores['commentary'][:120]}"
+        )
 
 
 def get_top_papers(limit: int = 12) -> List[Dict[str, Any]]:
-    init_db()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
     cur.execute(
         """
-        SELECT title, abstract, url, published_date, authors, source, cited_by_count,
-               relevance, novelty, grant_potential, collaboration_potential,
-               industry_potential, teaching_public_value, feasibility, risk, total_score,
-               agent_commentary, evidence_gaps, recommended_action
+        SELECT
+            title, abstract, url, published_date, authors, source,
+            cited_by_count, relevance, novelty, grant_potential,
+            collaboration_potential, industry_potential,
+            teaching_public_value, total_score,
+            agent_commentary, recommended_action
         FROM papers
         ORDER BY total_score DESC, published_date DESC
         LIMIT ?
         """,
         (limit,),
     )
+
     rows = cur.fetchall()
     conn.close()
-    keys = [
-        "title", "abstract", "url", "published_date", "authors", "source", "cited_by_count",
-        "relevance", "novelty", "grant_potential", "collaboration_potential", "industry_potential",
-        "teaching_public_value", "feasibility", "risk", "total_score", "agent_commentary",
-        "evidence_gaps", "recommended_action",
-    ]
-    return [dict(zip(keys, row)) for row in rows]
 
+    papers = []
+    for r in rows:
+        papers.append(
+            {
+                "title": r[0],
+                "abstract": r[1],
+                "url": r[2],
+                "published_date": r[3],
+                "authors": r[4],
+                "source": r[5],
+                "cited_by_count": r[6],
+                "relevance": r[7],
+                "novelty": r[8],
+                "grant_potential": r[9],
+                "collaboration_potential": r[10],
+                "industry_potential": r[11],
+                "teaching_public_value": r[12],
+                "total_score": r[13],
+                "agent_commentary": r[14],
+                "recommended_action": r[15],
+            }
+        )
 
-# -----------------------------
-# Reports and evolution
-# -----------------------------
+    return papers
+
 
 def generate_weekly_brief(limit: int = 12) -> str:
-    ensure_dirs()
+    init_db()
     profile = load_profile()
+    settings = load_settings()
     papers = get_top_papers(limit=limit)
+
     if not papers:
         return "No papers found yet. Run: python agent.py run"
-    paper_text = "\n\n".join(json.dumps(p, indent=2, ensure_ascii=False) for p in papers)
-    system = "You are a strategic research operating system. Produce actionable weekly intelligence."
+
+    paper_text = "\n\n".join(
+        [
+            textwrap.dedent(
+                f"""
+                Title: {p["title"]}
+                Source: {p["source"]}
+                Date: {p["published_date"]}
+                Authors: {p["authors"]}
+                Score: {p["total_score"]}
+                Action: {p["recommended_action"]}
+                Commentary: {p["agent_commentary"]}
+                URL: {p["url"]}
+                """
+            ).strip()
+            for p in papers
+        ]
+    )
+
     prompt = f"""
-Profile:
-{mission_context(profile)}
+You are my Research Evolution Agent.
 
-Recent memories:
-{format_memories(load_recent_memories(20))}
+My research profile:
+{yaml.safe_dump(profile, sort_keys=False, allow_unicode=True)}
 
-Top papers:
-{paper_text}
+Create a Weekly Research Evolution Brief.
 
-Create a Weekly Research Evolution Brief with:
-1. Executive Summary
-2. Top 5 opportunities
-3. Best research gap
-4. Grant angle
-5. Collaboration angle
-6. Teaching/LinkedIn angle
-7. Risks and missing evidence
-8. Top 5 high-leverage tasks for this week
-"""
-    brief = ask_llm(system, prompt, temperature=0.25, num_ctx=12000)
-    filename = os.path.join(REPORT_DIR, f"weekly_brief_{today()}.md")
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(brief)
-    print(f"[bold magenta]Saved report:[/bold magenta] {filename}")
-    save_memory("weekly_brief", brief[:1800], source=filename, confidence=0.75, tags=["brief", "strategy"])
-    return brief
+Use this format:
 
+# Weekly Research Evolution Brief
 
-def generate_research_gap_analysis(limit: int = 20) -> str:
-    ensure_dirs()
-    profile = load_profile()
-    papers = get_top_papers(limit=limit)
-    if not papers:
-        return "No papers found yet. Run: python agent.py run"
-    paper_text = "\n\n".join(json.dumps(p, indent=2, ensure_ascii=False) for p in papers)
-    system = "You are a skeptical research strategist. Compare across papers and identify fundable gaps."
-    prompt = f"""
-Profile:
-{mission_context(profile)}
+## 1. Executive Summary
+Give a concise strategic summary.
+
+## 2. Top 5 Papers or Opportunities
+For each:
+- Title
+- Why it matters
+- Connection to my work
+- Recommended action
+
+## 3. Emerging Research Gap
+Identify one realistic research gap I may be positioned to attack.
+
+## 4. Grant Angle
+Suggest one grant proposal angle.
+
+## 5. Collaboration Angle
+Suggest one type of collaborator or institution.
+
+## 6. Industry Angle
+Suggest one industry application or company angle.
+
+## 7. Teaching / LinkedIn Angle
+Suggest one public-facing explanation or post idea.
+
+## 8. One High-Leverage Action This Week
+Give one specific action.
 
 Papers:
 {paper_text}
-
-Do not summarize one paper at a time. Compare patterns.
-Return markdown sections:
-# Research Gap Analysis
-## 1. Best Gap Candidate
-## 2. Evidence Pattern
-## 3. Why It Matters
-## 4. Fit to My Strengths
-## 5. Possible Research Question
-## 6. Grant Concept
-## 7. Reviewer Attack Points
-## 8. Next 3 Actions
 """
-    gap = ask_llm(system, prompt, temperature=0.25, num_ctx=12000)
-    filename = os.path.join(REPORT_DIR, f"research_gap_analysis_{today()}.md")
+
+    response = chat(
+        model=settings["model"],
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.25,
+            "num_ctx": 8192,
+        },
+    )
+
+    brief = get_ollama_content(response)
+
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    filename = os.path.join(
+        REPORT_DIR,
+        f"weekly_brief_{dt.date.today().isoformat()}.md",
+    )
+
     with open(filename, "w", encoding="utf-8") as f:
-        f.write(gap)
-    print(f"[bold magenta]Saved gap analysis:[/bold magenta] {filename}")
-    save_memory("research_gap", gap[:1800], source=filename, confidence=0.7, tags=["gap", "grant"])
-    return gap
+        f.write(brief)
+
+    print(f"[bold magenta]Saved report:[/bold magenta] {filename}")
+    return brief
 
 
+def clean_yaml(text: str) -> str:
+    text = text.strip()
+
+    fenced = re.search(r"```(?:yaml|yml)?\s*(.*?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    return text
+
+
+# Topics that must never be dropped by any LLM-driven evolution.
 PROTECTED_TOPICS = [
-    "OLED", "TADF", "organic semiconductor", "quantum chemistry", "red-NIR emission",
-    "lanthanide complex", "charge transport", "device degradation",
+    "OLED",
+    "TADF",
+    "organic semiconductor",
+    "quantum chemistry",
+    "red-NIR emission",
+    "lanthanide complex",
+    "charge transport",
+    "device degradation",
 ]
+
+# Substrings that must never appear in negative_filters — the LLM occasionally
+# adds core research topics as filters when it misreads the curation stats.
 NEVER_IN_FILTERS = [
     "oled", "tadf", "organic", "semiconductor", "quantum", "lanthanide",
-    "device fabrication", "device physics", "charge transport", "red-nir", "nir",
-    "exciplex", "phosphorescent", "emission", "emitter",
+    "device fabrication", "device physics", "charge transport", "red-nir",
+    "nir", "exciplex", "phosphorescent", "emission", "emitter",
 ]
+
+# Weight keys that must always be present.
 REQUIRED_WEIGHT_KEYS = [
-    "relevance", "novelty", "grant_potential", "collaboration_potential",
-    "industry_potential", "teaching_public_value",
+    "relevance",
+    "novelty",
+    "grant_potential",
+    "collaboration_potential",
+    "industry_potential",
+    "teaching_public_value",
 ]
 
 
 def _sanitize_profile(updated: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any]:
-    existing = list(updated.get("topics", []) or [])
+    """Guard rails applied after every LLM-driven profile update."""
+
+    # 1. Restore any protected topics that were dropped.
+    existing = updated.get("topics", [])
     for t in PROTECTED_TOPICS:
         if t not in existing:
             existing.append(t)
-    seen_topics, deduped_topics = set(), []
-    for t in existing:
-        t = str(t).strip()
-        if t and t.lower() not in seen_topics:
-            seen_topics.add(t.lower())
-            deduped_topics.append(t)
-    updated["topics"] = deduped_topics
+    updated["topics"] = existing
 
-    raw, orig_w = updated.get("weights", {}) or {}, original.get("weights", {}) or {}
+    # 2. Ensure all required weight keys exist (fall back to original values).
+    raw = updated.get("weights", {})
+    orig_w = original.get("weights", {})
     clean: Dict[str, float] = {}
     for k in REQUIRED_WEIGHT_KEYS:
+        raw_val = raw.get(k, orig_w.get(k, 1.0 / len(REQUIRED_WEIGHT_KEYS)))
         try:
-            clean[k] = float(str(raw.get(k, orig_w.get(k, 1 / len(REQUIRED_WEIGHT_KEYS)))).split()[0])
-        except Exception:
-            clean[k] = float(orig_w.get(k, 1 / len(REQUIRED_WEIGHT_KEYS)))
-    total = sum(clean.values()) or 1.0
-    updated["weights"] = {k: round(v / total, 4) for k, v in clean.items()}
+            clean[k] = float(str(raw_val).split()[0])  # strip inline comments
+        except (ValueError, TypeError):
+            clean[k] = orig_w.get(k, 1.0 / len(REQUIRED_WEIGHT_KEYS))
 
+    # 3. Renormalise weights to exactly 1.0.
+    total_w = sum(clean.values()) or 1.0
+    updated["weights"] = {k: round(v / total_w, 4) for k, v in clean.items()}
+
+    # 4. Preserve watchlist and brief_instruction if LLM dropped them.
     for key in ("watchlist", "brief_instruction", "identity"):
         if key not in updated and key in original:
             updated[key] = original[key]
 
-    seen_filters, deduped_filters = set(), []
-    for f in updated.get("negative_filters", []) or []:
-        f_str = str(f).strip()
-        f_lower = f_str.lower()
-        if not f_str or f_lower in seen_filters or any(bad in f_lower for bad in NEVER_IN_FILTERS):
+    # 5. Deduplicate negative_filters, remove any that overlap with core topics.
+    seen_filters: set = set()
+    deduped = []
+    for f in updated.get("negative_filters", []):
+        f_stripped = f.strip()
+        f_lower = f_stripped.lower()
+        if f_lower in seen_filters:
+            continue
+        # Reject any filter whose text contains a protected research keyword.
+        if any(bad in f_lower for bad in NEVER_IN_FILTERS):
             continue
         seen_filters.add(f_lower)
-        deduped_filters.append(f_str)
-    updated["negative_filters"] = deduped_filters
+        deduped.append(f_stripped)
+    updated["negative_filters"] = deduped
+
+    # 6. Deduplicate topics, preserve order.
+    seen_topics: set = set()
+    deduped_topics = []
+    for t in updated.get("topics", []):
+        if t.strip().lower() not in seen_topics:
+            seen_topics.add(t.strip().lower())
+            deduped_topics.append(t.strip())
+    updated["topics"] = deduped_topics
+
     return updated
 
 
-def evolve_profile_from_feedback(feedback_text: str, *, require_approval: bool = False) -> None:
+def evolve_profile_from_feedback(feedback_text: str) -> None:
     init_db()
     profile = load_profile()
-    if require_approval:
-        print("[yellow]Profile evolution requested. Review feedback before applying:[/yellow]")
-        print(feedback_text)
-        answer = input("Apply this profile update? Type YES to continue: ")
-        if answer.strip() != "YES":
-            print("[yellow]Cancelled.[/yellow]")
-            return
+    settings = load_settings()
 
-    system = "You improve a YAML research profile conservatively. Preserve core identity and protected topics."
     prompt = f"""
-Current YAML profile:
-{mission_context(profile)}
+You are improving my Research Evolution Agent.
 
-Feedback:
+Current YAML research profile:
+{yaml.safe_dump(profile, sort_keys=False, allow_unicode=True)}
+
+User feedback:
 {feedback_text}
 
+Update the YAML profile carefully.
+
 Rules:
-- Keep keys: identity, topics, weights, watchlist, negative_filters, brief_instruction.
-- Weights must be plain numbers only.
-- Never remove OLED, TADF, organic semiconductor, red-NIR emission, lanthanide complex, charge transport.
-- Add negative_filters only for durable irrelevant patterns.
-- Return only valid YAML.
+- Keep the same top-level keys: identity, topics, weights, watchlist, negative_filters, brief_instruction.
+- Weights must be plain numbers only — no text, no comments, no parentheses.
+- Adjust weights only when justified by the feedback.
+- Add topics only if they are durable research interests.
+- Add to negative_filters when feedback identifies irrelevant outputs.
+- Never remove OLED, TADF, organic semiconductor, or red-NIR emission from topics.
+- Return only valid YAML, nothing else.
 """
-    yaml_text = clean_yaml(ask_llm(system, prompt, temperature=0.1, num_ctx=8192))
+
+    response = chat(
+        model=settings["model"],
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0.1, "num_ctx": 4096},
+    )
+
+    yaml_text = clean_yaml(get_ollama_content(response))
+
     try:
         updated = yaml.safe_load(yaml_text)
-        required = {"identity", "topics", "weights", "watchlist", "negative_filters"}
-        if not required.issubset(set(updated.keys())):
-            raise ValueError(f"Updated YAML missing keys: {required - set(updated.keys())}")
+
+        required_keys = {"identity", "topics", "weights", "watchlist", "negative_filters"}
+        if not required_keys.issubset(set(updated.keys())):
+            raise ValueError(f"Updated YAML missing keys: {required_keys - set(updated.keys())}")
+
         updated = _sanitize_profile(updated, profile)
         save_profile(updated)
+
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        cur.execute("INSERT INTO feedback (feedback_text, created_at) VALUES (?, ?)", (feedback_text, now()))
+        cur.execute(
+            "INSERT INTO feedback (feedback_text, created_at) VALUES (?, ?)",
+            (feedback_text, dt.datetime.now().isoformat(timespec="seconds")),
+        )
         conn.commit()
         conn.close()
-        save_memory("profile_evolution", feedback_text, "feedback", confidence=0.8, tags=["profile", "evolution"])
+
+        w = updated["weights"]
         print("[bold green]Profile evolved successfully.[/bold green]")
+        print(f"  Topics  : {len(updated['topics'])} ({', '.join(updated['topics'][:4])}…)")
+        print(f"  Weights : relevance={w['relevance']:.2f}  novelty={w['novelty']:.2f}  "
+              f"grant={w['grant_potential']:.2f}  (sum={sum(w.values()):.3f})")
+
     except Exception as e:
         print("[red]Could not safely update profile.[/red]")
         print(e)
@@ -1055,99 +758,247 @@ Rules:
 
 
 def generate_self_feedback(limit: int = 20) -> str:
+    """LLM critiques the agent's own paper curation and returns plain-English feedback."""
     profile = load_profile()
+    settings = load_settings()
     papers = get_top_papers(limit=limit)
-    if not papers:
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT total_score, recommended_action, source, title FROM papers"
+    )
+    all_rows = cur.fetchall()
+    conn.close()
+
+    if not all_rows:
         return ""
-    system = "You are the self-improvement module. Critique curation and workflow quality."
-    prompt = f"""
-Profile:
-{mission_context(profile)}
 
-Top papers:
-{json.dumps(papers, indent=2, ensure_ascii=False)}
+    scores = [r[0] for r in all_rows]
+    avg_score = sum(scores) / len(scores)
+    action_counts: Dict[str, int] = {}
+    for r in all_rows:
+        action_counts[r[1]] = action_counts.get(r[1], 0) + 1
+    high = sum(1 for s in scores if s >= 6.0)
+    low  = sum(1 for s in scores if s < 3.0)
 
-Write 3-6 sentences of concrete feedback to improve future outputs.
-Focus on low-value patterns, missed grant angles, weak evidence, and scoring calibration.
-Do not output YAML or JSON.
+    paper_summary = "\n".join(
+        f"  {p['total_score']:.2f} | {p['recommended_action']:<18} | {p['title'][:80]}"
+        for p in papers
+    )
+
+    prompt = f"""You are the self-improvement module of the Research Evolution Agent.
+
+Current research profile:
+{yaml.safe_dump(profile, sort_keys=False, allow_unicode=True)}
+
+Curation statistics from the database:
+  Total papers scored : {len(all_rows)}
+  Average score       : {avg_score:.2f} / 10
+  High-relevance (≥6) : {high}
+  Low-relevance (<3)  : {low}
+  Action breakdown    : {action_counts}
+
+Top {limit} papers by score:
+{paper_summary}
+
+Task: Write specific, actionable feedback (3-6 sentences) to improve the research profile.
+
+Focus on:
+- What topics or paper types are producing too many low-score results
+- What is being missed or under-weighted (red-NIR TADF, lanthanide, device fabrication, grants)
+- Whether negative_filters should be tightened
+- Whether any weights should shift to reflect the researcher's priorities
+
+Rules:
+- Be concrete — reference actual patterns you see in the paper list above.
+- Do NOT output JSON or YAML. Output plain English feedback only.
+- Write as if a researcher is reviewing the agent's weekly output and giving guidance.
 """
-    return ask_llm(system, prompt, temperature=0.3, num_ctx=8192).strip()
+
+    response = chat(
+        model=settings["model"],
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0.3, "num_ctx": 4096},
+    )
+
+    return get_ollama_content(response).strip()
 
 
-def auto_evolve(limit: int = 20, apply: bool = False) -> None:
+def auto_evolve(limit: int = 20) -> None:
+    """Full self-evolution cycle: critique curation → generate feedback → update profile."""
+    init_db()
+
     print("[bold blue]── Self-Evolution Cycle ──[/bold blue]")
+    print("[dim]Step 1/2  Generating self-critique…[/dim]")
+
     feedback = generate_self_feedback(limit=limit)
+
     if not feedback:
         print("[yellow]No papers in database. Run: python agent.py run[/yellow]")
         return
-    ensure_dirs()
-    fb_file = os.path.join(REPORT_DIR, f"self_feedback_{today()}.md")
-    with open(fb_file, "w", encoding="utf-8") as f:
-        f.write(f"# Self-Generated Feedback — {today()}\n\n{feedback}")
-    print("[bold yellow]Self-generated feedback:[/bold yellow]")
+
+    print("\n[bold yellow]Self-generated feedback:[/bold yellow]")
     print(feedback)
-    print(f"[dim]Feedback saved → {fb_file}[/dim]")
-    if apply:
-        evolve_profile_from_feedback(feedback, require_approval=True)
-    else:
-        print("[yellow]Profile not changed. Re-run with --apply to update after approval.[/yellow]")
+    print()
+
+    # Save the auto-generated feedback to reports/ for audit trail.
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    fb_file = os.path.join(
+        REPORT_DIR,
+        f"self_feedback_{dt.date.today().isoformat()}.md",
+    )
+    with open(fb_file, "w", encoding="utf-8") as f:
+        f.write(f"# Self-Generated Feedback — {dt.date.today().isoformat()}\n\n")
+        f.write(feedback)
+    print(f"[dim]Feedback saved → {fb_file}[/dim]\n")
+
+    print("[dim]Step 2/2  Applying feedback to profile…[/dim]")
+    evolve_profile_from_feedback(feedback)
 
 
-def run_full_loop(max_per_topic: int = 3, brief_limit: int = 12, gap_limit: int = 20, apply_evolution: bool = False) -> None:
-    print("[bold cyan]══ Research Evolution Agent — Agentic Loop ══[/bold cyan]\n")
+def run_full_loop(max_per_topic: int = 3, brief_limit: int = 12, gap_limit: int = 20) -> None:
+    """Full autonomous cycle: run → brief → gap → self-evolve."""
+    print("[bold cyan]══ Research Evolution Agent — Full Loop ══[/bold cyan]\n")
+
     print("[bold]Phase 1/4  Fetching and scoring papers…[/bold]")
     collect_and_score(max_per_topic=max_per_topic)
-    print("\n[bold]Phase 2/4  Generating weekly brief…[/bold]")
+    print()
+
+    print("[bold]Phase 2/4  Generating weekly brief…[/bold]")
     generate_weekly_brief(limit=brief_limit)
-    print("\n[bold]Phase 3/4  Generating gap analysis…[/bold]")
+    print()
+
+    print("[bold]Phase 3/4  Generating gap analysis…[/bold]")
     generate_research_gap_analysis(limit=gap_limit)
-    print("\n[bold]Phase 4/4  Self-evolution review…[/bold]")
-    auto_evolve(limit=gap_limit, apply=apply_evolution)
-    print("\n[bold cyan]══ Loop complete. ══[/bold cyan]")
+    print()
+
+    print("[bold]Phase 4/4  Self-evolving profile…[/bold]")
+    auto_evolve(limit=gap_limit)
+    print()
+
+    print("[bold cyan]══ Loop complete. Profile updated for next run. ══[/bold cyan]")
 
 
 def show_top(limit: int = 10) -> None:
     papers = get_top_papers(limit=limit)
+
     if not papers:
         print("[yellow]No papers yet. Run: python agent.py run[/yellow]")
         return
+
     for i, p in enumerate(papers, start=1):
         print(f"\n[bold cyan]{i}. {p['title']}[/bold cyan]")
-        print(f"Score: {p['total_score']} | Action: {p['recommended_action']} | Risk: {p.get('risk', 5)}")
+        print(f"Score: {p['total_score']} | Action: {p['recommended_action']}")
         print(f"Date: {p['published_date']} | Source: {p['source']}")
         print(f"Authors: {p['authors']}")
         print(f"Commentary: {p['agent_commentary']}")
-        print(f"Evidence gaps: {p.get('evidence_gaps', '')}")
         print(f"URL: {p['url']}")
 
 
-def show_tasks(limit: int = 20) -> None:
+def generate_research_gap_analysis(limit: int = 20) -> str:
     init_db()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT id, title, agent, priority, effort, risk, status, created_at FROM tasks ORDER BY status, priority DESC, id DESC LIMIT ?",
-        (limit,),
+    profile = load_profile()
+    settings = load_settings()
+    papers = get_top_papers(limit=limit)
+
+    if not papers:
+        return "No papers found yet. Run: python agent.py run"
+
+    paper_text = "\n\n".join(
+        [
+            f"""
+Title: {p["title"]}
+Date: {p["published_date"]}
+Authors: {p["authors"]}
+Score: {p["total_score"]}
+Abstract: {p["abstract"][:1200]}
+Commentary: {p["agent_commentary"]}
+"""
+            for p in papers
+        ]
     )
-    rows = cur.fetchall()
-    conn.close()
-    if not rows:
-        print("[yellow]No tasks yet. Run: python agent.py think 'your idea'[/yellow]")
-        return
-    for r in rows:
-        print(f"[bold]{r[0]}.[/bold] {r[1]} | agent={r[2]} | P={r[3]} E={r[4]} R={r[5]} | {r[6]} | {r[7]}")
 
+    prompt = f"""
+You are my Research Evolution Agent.
 
-def print_json(data: Dict[str, Any]) -> None:
-    print(json.dumps(data, indent=2, ensure_ascii=False))
+My research profile:
+{yaml.safe_dump(profile, sort_keys=False, allow_unicode=True)}
 
+Analyze these papers to identify research gaps.
 
-# -----------------------------
-# CLI
-# -----------------------------
+Do not merely summarize. Compare across papers.
+
+Find:
+1. Repeated limitations across the papers
+2. Overcrowded research areas
+3. Underexplored combinations of topics
+4. Missing methods or missing measurements
+5. Gaps connected to OLEDs, TADF, organic semiconductors, quantum chemistry, red-NIR emission, lanthanide complexes, photobiomodulation, device fabrication, charge transport, and grants
+6. Which gap best fits my strengths
+7. Which gap could become a grant proposal
+8. Which gap could become a publishable paper
+9. Which gap has industry or biomedical relevance
+10. One concrete next action
+
+Return this format:
+
+# Research Gap Analysis
+
+## 1. Best Research Gap Candidate
+State the gap clearly.
+
+## 2. Evidence from Papers
+Explain which patterns in the papers support this gap.
+
+## 3. Why This Gap Matters
+Explain scientific, technological, grant, or industry importance.
+
+## 4. Why I Am Positioned to Work on It
+Connect to my OLED/device/organic electronics background.
+
+## 5. Possible Research Question
+Write one strong research question.
+
+## 6. Possible Grant Angle
+Write one grant concept.
+
+## 7. Risk or Weakness
+Explain why this gap may be hard or uncertain.
+
+## 8. Next Action
+Give one concrete action this week.
+
+Papers:
+{paper_text}
+"""
+
+    response = chat(
+        model=settings["model"],
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.25,
+            "num_ctx": 8192,
+        },
+    )
+
+    gap_analysis = get_ollama_content(response)
+
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    filename = os.path.join(
+        REPORT_DIR,
+        f"research_gap_analysis_{dt.date.today().isoformat()}.md",
+    )
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(gap_analysis)
+
+    print(f"[bold magenta]Saved gap analysis:[/bold magenta] {filename}")
+    return gap_analysis
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Agentic Research Evolution Agent powered by local Ollama/Qwen3")
+    parser = argparse.ArgumentParser(description="Research Evolution Agent")
     sub = parser.add_subparsers(dest="command")
 
     run_parser = sub.add_parser("run", help="Search and score new papers.")
@@ -1159,55 +1010,42 @@ def main() -> None:
     top_parser = sub.add_parser("top", help="Show top scored papers.")
     top_parser.add_argument("--limit", type=int, default=10)
 
+    feedback_parser = sub.add_parser("feedback", help="Evolve profile from feedback.")
+    feedback_parser.add_argument("text", type=str)
+
     gap_parser = sub.add_parser("gap", help="Generate research gap analysis.")
     gap_parser.add_argument("--limit", type=int, default=20)
 
-    think_parser = sub.add_parser("think", help="Run the agentic multi-role workflow on an idea, paper note, or proposal fragment.")
-    think_parser.add_argument("text", type=str)
-    think_parser.add_argument("--no-communication", action="store_true")
-
-    feedback_parser = sub.add_parser("feedback", help="Evolve profile from explicit feedback.")
-    feedback_parser.add_argument("text", type=str)
-    feedback_parser.add_argument("--apply", action="store_true", help="Ask for approval, then apply the profile update.")
-
-    evolve_parser = sub.add_parser("evolve", help="Self-critique curation and optionally update profile after approval.")
+    evolve_parser = sub.add_parser("evolve", help="Self-evolve: agent critiques its own curation and updates profile.")
     evolve_parser.add_argument("--limit", type=int, default=20)
-    evolve_parser.add_argument("--apply", action="store_true")
 
-    loop_parser = sub.add_parser("loop", help="Full agentic cycle: run → brief → gap → self-evolution review.")
+    loop_parser = sub.add_parser("loop", help="Full autonomous cycle: run → brief → gap → self-evolve.")
     loop_parser.add_argument("--max-per-topic", type=int, default=3)
     loop_parser.add_argument("--brief-limit", type=int, default=12)
-    loop_parser.add_argument("--gap-limit", type=int, default=20)
-    loop_parser.add_argument("--apply-evolution", action="store_true")
-
-    tasks_parser = sub.add_parser("tasks", help="Show agent-created task ledger.")
-    tasks_parser.add_argument("--limit", type=int, default=20)
+    loop_parser.add_argument("--gap-limit",   type=int, default=20)
 
     args = parser.parse_args()
 
     if args.command == "run":
         collect_and_score(max_per_topic=args.max_per_topic)
     elif args.command == "brief":
-        print("\n" + generate_weekly_brief(limit=args.limit))
+        brief = generate_weekly_brief(limit=args.limit)
+        print("\n" + brief)
     elif args.command == "top":
         show_top(limit=args.limit)
-    elif args.command == "gap":
-        print("\n" + generate_research_gap_analysis(limit=args.limit))
-    elif args.command == "think":
-        print_json(run_agentic_workflow(args.text, include_communication=not args.no_communication))
     elif args.command == "feedback":
-        evolve_profile_from_feedback(args.text, require_approval=not args.apply)
+        evolve_profile_from_feedback(args.text)
+    elif args.command == "gap":
+        gap = generate_research_gap_analysis(limit=args.limit)
+        print("\n" + gap)
     elif args.command == "evolve":
-        auto_evolve(limit=args.limit, apply=args.apply)
+        auto_evolve(limit=args.limit)
     elif args.command == "loop":
         run_full_loop(
             max_per_topic=args.max_per_topic,
             brief_limit=args.brief_limit,
             gap_limit=args.gap_limit,
-            apply_evolution=args.apply_evolution,
         )
-    elif args.command == "tasks":
-        show_tasks(limit=args.limit)
     else:
         parser.print_help()
 
