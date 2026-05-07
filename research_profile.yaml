@@ -1,0 +1,45 @@
+identity:
+  name: Research Evolution Agent
+  mission: Help evolve my research direction in OLEDs, TADF, organic semiconductors,
+    quantum chemistry, device physics, grants, collaborators, and industry applications.
+
+topics:
+  - OLED
+  - TADF
+  - organic semiconductor
+  - red-NIR emission
+  - lanthanide complex
+  - exciplex system
+  - charge transport
+  - molecular vibration
+  - device degradation
+  - machine learning materials discovery
+  - quantum chemistry
+
+weights:
+  relevance: 0.339
+  novelty: 0.2542
+  grant_potential: 0.1695
+  collaboration_potential: 0.1271
+  industry_potential: 0.0254
+  teaching_public_value: 0.0848
+
+watchlist:
+  researchers: []
+  institutions: []
+  companies:
+    - OLEDWorks
+    - Universal Display Corporation
+    - Samsung Display
+    - LG Display
+    - Merck
+
+negative_filters:
+  - purely incremental
+  - not related to organic electronics
+  - no device relevance
+  - photobiomodulation
+  - non-device-related research
+
+brief_instruction:
+  output_style: "strategic, concise, critical, action-oriented"
